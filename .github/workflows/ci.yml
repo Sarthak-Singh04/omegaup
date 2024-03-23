@@ -192,98 +192,101 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - uses: actions/checkout@v2
-        with:
-          submodules: recursive
+       -  name: Checkout Repository
+          uses: actions/checkout@v4
+          with:
+              submodules: recursive
 
-      - name: Use PHP 8.1
-        run: |
-          sudo update-alternatives --install /usr/bin/php php /usr/bin/php8.1 100
-          # Enable APCu for tests
-          echo 'apc.enable_cli=1' | sudo tee --append /etc/php/8.1/cli/conf.d/20-apcu.ini >/dev/null
-          # Enable coverage for XDebug so that codecov can do its magic.
-          echo 'xdebug.mode=coverage' | sudo tee --append /etc/php/8.1/cli/conf.d/20-xdebug.ini >/dev/null
+       -  name: Set up PHP 8.3 with Extensions
+          uses: shivammathur/setup-php@v2
+          with:
+              php-version: '8.3'
+              extensions: apcu, xdebug
+              ini-values: apc.enable_cli=1, xdebug.mode=coverage
+              coverage: none
+       -  name: Create default configuration files
+          run: |
+              cat > frontend/server/config.php <<EOF
+              <?php
+              define('OMEGAUP_LOG_FILE', 'php://stderr');
+              EOF
 
-      - name: Create default configuration files
-        run: |
-          cat > frontend/server/config.php <<EOF
-          <?php
-          define('OMEGAUP_LOG_FILE', 'php://stderr');
-          EOF
+       -  name: Install Node.js and Yarn Dependencies
+          uses: actions/setup-node@v4
+          with:
+              node-version: '18'
+              cache: yarn
+       -  name: Set up Python 3.9
+          uses: actions/setup-python@v4
+          with:
+              python-version: '3.9'
 
-      - name: Install yarn dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ca-certificates curl gnupg
-          sudo mkdir -p /etc/apt/keyrings
-          curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-          NODE_MAJOR=18
-          echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" | sudo tee /etc/apt/sources.list.d/nodesource.list
-          sudo apt-get update
-          sudo apt-get install nodejs -y
-          sudo apt-get update
-          sudo apt-get install -y build-essential
-          sudo apt-get install -y python3
-          yarn global add node-gyp
-          yarn install
+       -  name: Install Python dependencies
+          run: |
+              echo "Installing Python dependencies..."
+              python -m pip install --upgrade pip
+              pip install yapf==0.30.0
 
-      - name: Install composer dependencies
-        run: composer install --prefer-dist --no-progress
+       -  name: Cache Composer Dependencies
+          uses: actions/cache@v4
+          with:
+              path: |
+                  vendor
+                  ~/.composer/cache
+              key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+              restore-keys: |
+                  ${{ runner.os }}-composer-
 
-      - name: Install Python dependencies
-        run: python3 -m pip install --user yapf==0.30.0
+       -  name: Install Composer Dependencies
+          run: composer install --prefer-dist --no-progress
 
-      - name: Get docker container
-        run: ./stuff/lint.sh ensure-container
+       -  name: Prepare Environment
+          run: |
+              ./stuff/lint.sh ensure-container
+              mkdir -p frontend/www/{phpminiadmin,preguntas}
+              cat > frontend/server/config.php <<EOF
+              <?php
+              define('OMEGAUP_LOG_FILE', 'php://stderr');
+              EOF
+              touch 'frontend/tests/test_config.php'
 
-      - name: Run linters
-        run: |
-          # Create optional directories to simplify psalm config.
-          mkdir -p frontend/www/{phpminiadmin,preguntas}
-          cat > frontend/server/config.php <<EOF
-          <?php
-          define('OMEGAUP_LOG_FILE', 'php://stderr');
-          EOF
-          touch 'frontend/tests/test_config.php'
+       -  name: Run Linters and Static Analysis
+          run: |
+              docker run --rm \
+                --user "$(id -u)":"$(id -g)" \
+                --volume "${PWD}:/src" \
+                --volume "${PWD}:${PWD}" \
+                --volume "${PWD}:/opt/omegaup" \
+                --mount 'type=tmpfs,destination=/home/.cache,tmpfs-mode=1777' \
+                --mount 'type=tmpfs,destination=/home/.local,tmpfs-mode=1777' \
+                --env 'HOME=/home' \
+                --env 'MYPYPATH=/opt/omegaup/stuff' \
+                --env 'VIRTUAL_ENV=/opt/omegaup/stuff/venv' \
+                --entrypoint='' \
+                "$(grep CONTAINER_VERSION= stuff/lint.sh | cut -f2 -d=)" \
+                bash -c "\
+                  python3 -m venv /opt/omegaup/stuff/venv && \
+                  . /opt/omegaup/stuff/venv/bin/activate && \
+                  python3 -m pip install wheel && \
+                  python3 -m pip install -r /opt/omegaup/stuff/requirements.txt"
+              ./stuff/lint.sh --diagnostics-output=github validate --all < /dev/null
 
-          docker run --rm \
-            --user "$(id -u)":"$(id -g)" \
-            --volume "${PWD}:/src" \
-            --volume "${PWD}:${PWD}" \
-            --volume "${PWD}:/opt/omegaup" \
-            --mount 'type=tmpfs,destination=/home/.cache,tmpfs-mode=1777' \
-            --mount 'type=tmpfs,destination=/home/.local,tmpfs-mode=1777' \
-            --env 'HOME=/home' \
-            --env 'MYPYPATH=/opt/omegaup/stuff' \
-            --env 'VIRTUAL_ENV=/opt/omegaup/stuff/venv' \
-            --entrypoint='' \
-            "$(grep CONTAINER_VERSION= stuff/lint.sh | cut -f2 -d=)" \
-            bash -c "\
-            python3 -m venv /opt/omegaup/stuff/venv && \
-            . /opt/omegaup/stuff/venv/bin/activate && \
-            python3 -m pip install wheel && \
-            python3 -m pip install -r /opt/omegaup/stuff/requirements.txt"
-          ./stuff/lint.sh --diagnostics-output=github validate --all < /dev/null
+       -  name: Run Psalm for PHP Static Analysis
+          run: |
+              find frontend/ -name *.php \
+                -and -not -wholename 'frontend/server/libs/third_party/*' \
+                -and -not -wholename 'frontend/tests/badges/*' \
+                -and -not -wholename 'frontend/tests/controllers/*' \
+                -and -not -wholename 'frontend/tests/runfiles/*' \
+                -and -not -wholename 'frontend/www/preguntas/*' \
+              | xargs ./vendor/bin/psalm --output-format=github --long-progress --show-info=false
 
-      - name: Run Psalm
-        run: |
-          find frontend/ \
-            -name *.php \
-            -and -not -wholename 'frontend/server/libs/third_party/*' \
-            -and -not -wholename 'frontend/tests/badges/*' \
-            -and -not -wholename 'frontend/tests/controllers/*' \
-            -and -not -wholename 'frontend/tests/runfiles/*' \
-            -and -not -wholename 'frontend/www/preguntas/*' \
-          | xargs ./vendor/bin/psalm \
-            --output-format=github \
-            --long-progress \
-            --show-info=false
+       -  name: Find Unused Translation Strings
+          run: ./stuff/unused_translation_strings.py
 
-      - name: Find unused translation strings
-        run: ./stuff/unused_translation_strings.py
+       -  name: Validate Generated Python API Syntax
+          run: php frontend/server/cmd/APITool.php --file api.py | yapf > /dev/null
 
-      - name: Validate generated Python API syntax
-        run: php frontend/server/cmd/APITool.php --file api.py | yapf > /dev/null
 
   cypress:
     runs-on: ubuntu-22.04
